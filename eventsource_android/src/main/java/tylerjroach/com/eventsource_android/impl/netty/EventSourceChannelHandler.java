@@ -1,5 +1,7 @@
 package tylerjroach.com.eventsource_android.impl.netty;
 
+import android.util.Log;
+
 import org.jboss.netty.bootstrap.ClientBootstrap;
 import org.jboss.netty.channel.Channel;
 import org.jboss.netty.channel.ChannelEvent;
@@ -34,15 +36,14 @@ import tylerjroach.com.eventsource_android.impl.EventStreamParser;
 
 public class EventSourceChannelHandler extends SimpleChannelUpstreamHandler implements ConnectionHandler {
     private static final Pattern STATUS_PATTERN = Pattern.compile("HTTP/1.1 (\\d+) (.*)");
-    private static final Pattern CONTENT_TYPE_PATTERN = Pattern.compile("Content-Type: text/event-stream");
+    private static final Pattern CONTENT_TYPE_PATTERN = Pattern.compile("Content-Type: text/event-stream(.*)");
 
     private final EventSourceHandler eventSourceHandler;
     private final ClientBootstrap bootstrap;
-    private final URI uri;
     private final Map<String, String> headers;
     private final EventStreamParser messageDispatcher;
-
     private final Timer timer = new HashedWheelTimer();
+    private URI uri, requestUri;
     private Channel channel;
     private boolean reconnectOnClose = true;
     private long reconnectionTimeMillis;
@@ -51,6 +52,12 @@ public class EventSourceChannelHandler extends SimpleChannelUpstreamHandler impl
     private boolean headerDone;
     private Integer status;
     private AtomicBoolean reconnecting = new AtomicBoolean(false);
+    private StringBuffer data = new StringBuffer();
+
+    public EventSourceChannelHandler(EventSourceHandler eventSourceHandler, long reconnectionTimeMillis, ClientBootstrap bootstrap, URI uri, URI requestUri, Map<String, String> headers) {
+        this(eventSourceHandler, reconnectionTimeMillis, bootstrap, uri, headers);
+        this.requestUri = requestUri;
+    }
 
     public EventSourceChannelHandler(EventSourceHandler eventSourceHandler, long reconnectionTimeMillis, ClientBootstrap bootstrap, URI uri, Map<String, String> headers) {
         this.eventSourceHandler = eventSourceHandler;
@@ -61,6 +68,16 @@ public class EventSourceChannelHandler extends SimpleChannelUpstreamHandler impl
         this.messageDispatcher = new EventStreamParser(uri.toString(), eventSourceHandler, this);
     }
 
+    private static boolean isHexNumber(String cadena) {
+        try {
+            Long.parseLong(cadena, 16);
+            return true;
+        } catch (NumberFormatException ex) {
+            // Error handling code...
+            return false;
+        }
+    }
+
     @Override
     public void handleUpstream(ChannelHandlerContext ctx, ChannelEvent e) throws Exception {
         super.handleUpstream(ctx, e);
@@ -68,7 +85,15 @@ public class EventSourceChannelHandler extends SimpleChannelUpstreamHandler impl
 
     @Override
     public void channelConnected(ChannelHandlerContext ctx, ChannelStateEvent e) throws Exception {
-        HttpRequest request = new DefaultHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.GET, uri.toString());
+
+        HttpRequest request;
+
+        if (requestUri != null) {
+            request = new DefaultHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.GET, "/" + requestUri.toString());
+        } else {
+            request = new DefaultHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.GET, uri.toString());
+        }
+
         request.addHeader(Names.ACCEPT, "text/event-stream");
 
         if (headers != null) {
@@ -76,9 +101,8 @@ public class EventSourceChannelHandler extends SimpleChannelUpstreamHandler impl
                 request.addHeader(entry.getKey(), entry.getValue());
             }
         }
-
         request.addHeader(Names.HOST, uri.getHost());
-        request.addHeader(Names.ORIGIN, uri.getScheme()+"://" + uri.getHost());
+        request.addHeader(Names.ORIGIN, uri.getScheme() + "://" + uri.getHost());
         request.addHeader(Names.CACHE_CONTROL, "no-cache");
         if (lastEventId != null) {
             request.addHeader("Last-Event-ID", lastEventId);
@@ -94,7 +118,7 @@ public class EventSourceChannelHandler extends SimpleChannelUpstreamHandler impl
 
     @Override
     public void channelClosed(ChannelHandlerContext ctx, ChannelStateEvent e) throws Exception {
-    	eventSourceHandler.onClosed(reconnectOnClose);
+        eventSourceHandler.onClosed(reconnectOnClose);
         if (reconnectOnClose) {
             reconnect();
         }
@@ -102,43 +126,98 @@ public class EventSourceChannelHandler extends SimpleChannelUpstreamHandler impl
 
     @Override
     public void messageReceived(ChannelHandlerContext ctx, MessageEvent e) throws Exception {
-        String line = (String) e.getMessage();
-        if (status == null) {
-            Matcher statusMatcher = STATUS_PATTERN.matcher(line);
-            if (statusMatcher.matches()) {
-                status = Integer.parseInt(statusMatcher.group(1));
-                if (status != 200) {
-                    eventSourceHandler.onError(new EventSourceException("Bad status from " + uri + ": " + status));
-                    reconnect();
+        String messageAsString = (String) e.getMessage();
+
+        String[] lines = messageAsString.split("\\n",-1);
+        //int l = 0;
+        for (String dirtyLine : lines) {
+            String line = dirtyLine.replace("\r", "");
+            //l++;
+            //Log.d(EventSourceChannelHandler.class.getName(), "line" + l + ": " + line);
+            if (!headerDone) {
+                if (status == null) {
+                    // checking Status header
+                    Matcher statusMatcher = STATUS_PATTERN.matcher(line);
+                    if (statusMatcher.matches()) {
+                        status = Integer.parseInt(statusMatcher.group(1));
+                        if (status != 200) {
+                            eventSourceHandler.onError(new EventSourceException("Bad status from " + uri + ": " + status));
+                            reconnect();
+                            break;
+                        }
+                        //Log.d(EventSourceChannelHandler.class.getName(), "--- HTTP CONNECTED");
+                    } else {
+                        eventSourceHandler.onError(new EventSourceException("Not HTTP? " + uri + ": " + line));
+                        reconnect();
+                        break;
+                    }
                 }
-                return;
+                // checking Content-Type header
+                if (CONTENT_TYPE_PATTERN.matcher(line).matches()) {
+                    eventStreamOk = true;
+                    //Log.d(EventSourceChannelHandler.class.getName(), "--- SSE DETECTED");
+                }
+                // ignoring other headers
+                if (line.isEmpty()) {
+                    // checking end of header part
+                    headerDone = true;
+                    if (eventStreamOk) {
+                        eventSourceHandler.onConnect();
+                    } else {
+                        eventSourceHandler.onError(new EventSourceException("Not event stream: " + uri + " (expected Content-Type: text/event-stream"));
+                        reconnect();
+                        break;
+                    }
+                }
             } else {
-                eventSourceHandler.onError(new EventSourceException("Not HTTP? " + uri + ": " + line));
-                reconnect();
-            }
-        }
-        if (!headerDone) {
-            if (CONTENT_TYPE_PATTERN.matcher(line).matches()) {
-                eventStreamOk = true;
-            }
-            if (line.isEmpty()) {
-                headerDone = true;
-                if (eventStreamOk) {
-                    eventSourceHandler.onConnect();
+                // data flow: data line or data chunk
+                if (isChunkStart(line)) {
+                    // ignoring chunk size in case of chunk transfer Encoding
+                    //Log.d(EventSourceChannelHandler.class.getName(), "CHUNK WITH SIZE: " + line);
                 } else {
-                    eventSourceHandler.onError(new EventSourceException("Not event stream: " + uri + " (expected Content-Type: text/event-stream"));
-                    reconnect();
+                    String[] eventLines = line.split("\\n",-1);
+
+                    for (String eventLine : eventLines) {
+                        if (eventLine.startsWith("event:")) {
+                            // dispatching new event
+                            messageDispatcher.line(eventLine);
+                            //Log.d(EventSourceChannelHandler.class.getName(), "SSE EVENT: " + eventLine);
+                        } else if (eventLine.startsWith("id:")) {
+                            // dispatching event id
+                            messageDispatcher.line(eventLine);
+                            //Log.d(EventSourceChannelHandler.class.getName(), "SSE EVENT ID: " + eventLine);
+                        } else if (eventLine.startsWith("data:")) {
+                            // append first line to data : data may be chunked
+                            data.append(eventLine);
+                        } else if (eventLine.isEmpty() && data.length() != 0) {
+                            // end of data : dispatch aggregated data
+                            messageDispatcher.line(data.toString());
+                            // prepare next event data buffer
+                            //Log.d(EventSourceChannelHandler.class.getName(), "SSE EVENT DATA: " + data.toString());
+                            // dispatch the end line (empty line) in order to dispatch the event
+                            messageDispatcher.line(eventLine);
+                            data = new StringBuffer();
+                        } else {
+                            // new data chunk to append
+                            data.append(eventLine);
+                        }
+                    }
                 }
             }
-        } else {
-            messageDispatcher.line(line);
         }
+
     }
+
+    private boolean isChunkStart(String line) {
+
+        return isHexNumber(line);
+    }
+
 
     @Override
     public void exceptionCaught(ChannelHandlerContext ctx, ExceptionEvent e) throws Exception {
         Throwable error = e.getCause();
-        if(error instanceof ConnectException) {
+        if (error instanceof ConnectException) {
             error = new EventSourceException("Failed to connect to " + uri, error);
         }
         eventSourceHandler.onError(error);
@@ -170,15 +249,20 @@ public class EventSourceChannelHandler extends SimpleChannelUpstreamHandler impl
     }
 
     private void reconnect() {
-        if(!reconnecting.get()) {
+        if (!reconnecting.get()) {
             reconnecting.set(true);
+            data = new StringBuffer();
+            lastEventId = null;
+            status = null;
+            eventStreamOk = false;
+            headerDone = false;
             timer.newTimeout(new TimerTask() {
                 @Override
                 public void run(Timeout timeout) throws Exception {
                     reconnecting.set(false);
                     int port = uri.getPort();
-                    if (port==-1) {
-                    	port = (uri.getScheme().equals("https"))?443:80;
+                    if (port == -1) {
+                        port = (uri.getScheme().equals("https")) ? 443 : 80;
                     }
                     bootstrap.setOption("remoteAddress", new InetSocketAddress(uri.getHost(), port));
                     bootstrap.connect().await();

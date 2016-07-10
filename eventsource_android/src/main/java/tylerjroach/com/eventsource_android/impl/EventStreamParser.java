@@ -38,11 +38,7 @@ public class EventStreamParser {
         if (line.trim().isEmpty()) {
             dispatchEvent();
         } else if (line.startsWith(":")) {
-            try {
-                eventSourceHandler.onComment(line);
-            } catch (Exception e) {
-                eventSourceHandler.onError(e);
-            }
+            // ignore
         } else if ((colonIndex = line.indexOf(":")) != -1) {
             String field = line.substring(0, colonIndex);
             String value = line.substring(colonIndex + 1).replaceFirst(" ", EMPTY_STRING);
